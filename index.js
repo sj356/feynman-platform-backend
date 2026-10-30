@@ -1,6 +1,6 @@
 require('dotenv').config()
-const jwt = require('jsonwebtoken');
 const express = require('express');
+const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -30,13 +30,13 @@ app.get('/', (req,res)=>{
 // =========新增挂载路由=========
 // =========新增挂载路由=========
 console.log("准备加载users路由");
-app.use('/api/users', require('./routes/users'));
 console.log("准备加载knowledgePoints路由");
 //app.use('/api/knowledge-points', require('./routes/knowledgePoints'));
 
 app.use('/api/users', require('./routes/users'));
 app.use('/api/knowledge-points', require('./routes/knowledgePoints'));
-
+app.use('/api/audio', require('./routes/audio'));
+console.log("准备加载questions路由");
 // 获取当前登录用户信息接口
 app.get('/api/user', async (req,res)=>{
     try {

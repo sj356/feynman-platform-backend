@@ -4,6 +4,22 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
+const authMiddleware = (req, res, next) => {
+  const authStr = req.headers.authorization;
+  if (!authStr || !authStr.startsWith('Bearer ')) {
+    return res.status(401).json({msg: "未携带token"});
+  }
+  const token = authStr.split(' ')[1];
+  try {
+    // ✅ 和登录保持一致：读取环境变量 JWT_SECRET
+    const decode = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decode;
+    next();
+  } catch(e) {
+    return res.status(401).json({msg: "token无效或过期"});
+  }
+}
+
 // 用户注册接口【新增邮箱格式校验】
 router.post('/register', async (req,res)=>{
     try {
@@ -53,6 +69,17 @@ router.post('/login', async (req,res)=>{
     } catch (e) {
         res.status(500).json({msg:"服务器错误", error:e.message})
     }
+})
+
+// ✅ 新增 获取用户信息接口
+router.get('/info', authMiddleware, async (req, res)=>{
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    res.json(user);
+  } catch (err) {
+    console.log(err)
+    res.status(401).json({msg: "token无效"});
+  }
 })
 
 module.exports = router;
