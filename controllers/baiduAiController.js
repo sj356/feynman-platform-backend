@@ -452,3 +452,284 @@ ${studentAnswer}
     });
   }
 };
+
+// ========== 四、AI 知识点拆解 + 助教问答 ==========
+
+// POST /api/ai/breakdown  把大主题拆成若干子知识点
+// body: { topic }
+exports.breakdownTopics = async (req, res) => {
+  const { topic } = req.body;
+  if (!topic || !String(topic).trim()) {
+    return res.status(400).json({ msg: '缺少主题内容' });
+  }
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  const prompt = `
+你是一个计算机科学学习规划专家。请把下面的大主题拆解成 3 到 6 个循序渐进、相对独立的子知识点。
+
+【大主题】:
+"""
+${topic}
+"""
+
+注意：子知识点的标题和讲解中不要使用 LaTeX 公式，不要出现反斜杠字符。
+
+请严格按照以下 JSON 格式返回，不要包含任何额外解释、Markdown 代码块或文字：
+{
+  "topics": [
+    { "title": "子知识点标题", "content": "该子知识点的简明讲解，100-200字，适合作为学习笔记" }
+  ]
+}
+`;
+
+  try {
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'user', content: prompt }],
+        thinking: { type: 'disabled' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log('拆解模型原始返回:', response.data);
+
+    const llmText = extractLlmText(response.data);
+    let data;
+    try {
+      data = parseLlmJson(llmText);
+    } catch (parseError) {
+      console.error('拆解 JSON 解析失败:', llmText);
+      return res.status(500).json({ msg: 'AI 返回格式错误，请稍后重试' });
+    }
+
+    const topics = Array.isArray(data.topics)
+      ? data.topics.map((t) => ({ title: t.title || '', content: t.content || '' }))
+      : [];
+    res.json({ topics });
+  } catch (error) {
+    console.error('AI 拆解失败:', error.response ? error.response.data : error.message);
+    res.status(500).json({
+      msg: 'AI 拆解失败',
+      error: error.response ? error.response.data : error.message,
+    });
+  }
+};
+
+// POST /api/ai/chat  围绕单个知识点的多轮助教问答
+// body: { kpTitle, kpContent, messages: [{ role, content }] }
+exports.chatTutor = async (req, res) => {
+  const { kpTitle, kpContent, messages } = req.body;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ msg: '缺少对话内容' });
+  }
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  const systemContent = `你是一个耐心的计算机科学学习助教。请围绕下面这个知识点原文回答学生的问题，讲解清晰、举例恰当；如果问题超出知识点范围，可简要提示并引导回知识点，不要编造原文中没有的结论。
+
+【知识点标题】: ${kpTitle || '未命名'}
+【知识点原文】:
+"""
+${kpContent || '（无原文）'}
+"""`;
+
+  const history = messages.map((m) => ({
+    role: m.role === 'assistant' ? 'assistant' : 'user',
+    content: String(m.content || ''),
+  }));
+
+  try {
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'system', content: systemContent }, ...history],
+        thinking: { type: 'disabled' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    const reply = extractLlmText(response.data);
+    res.json({ reply });
+  } catch (error) {
+    console.error('AI 问答失败:', error.response ? error.response.data : error.message);
+    res.status(500).json({
+      msg: 'AI 问答失败',
+      error: error.response ? error.response.data : error.message,
+    });
+  }
+};
+
+// ========== 五、错题 AI 讲解 ==========
+
+// POST /api/ai/explain-wrong  结合知识点原文讲清错题，并给变式题
+// body: { kpTitle, kpContent, questionType, question, userAnswer, correctAnswer, explanation }
+exports.explainWrong = async (req, res) => {
+  const { kpTitle, kpContent, questionType, question, userAnswer, correctAnswer, explanation } = req.body;
+  if (!question) {
+    return res.status(400).json({ msg: '缺少错题内容' });
+  }
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  const typeMap = {
+    'single-choice': '单项选择',
+    'multiple-choice': '多项选择',
+    'true-false': '判断对错',
+    'short-answer': '简答题',
+  };
+
+  const prompt = `
+你是一名耐心的学习辅导老师。下面是学生答错的一道题，请结合知识点原文给出通俗讲解。
+
+【知识点标题】: ${kpTitle || '未命名'}
+【知识点原文】:
+"""
+${kpContent || '（无原文）'}
+"""
+【题型】: ${typeMap[questionType] || questionType || '未知'}
+【题目】: ${question}
+【学生作答】: ${userAnswer || '（未作答）'}
+【正确答案】: ${correctAnswer || '（见解析）'}
+【原有解析】: ${explanation || '（无）'}
+
+注意：讲解中不要使用 LaTeX 公式，不要出现反斜杠字符。
+
+请严格按以下 JSON 格式返回，不要包含 Markdown 代码块或额外文字：
+{
+  "explain": "用通俗的话讲清这道题为什么是这个答案，结合知识点原文，150-250字",
+  "pitfalls": "学生最容易混淆或出错的点，1-2句话",
+  "variant": "一道同知识点的同类变式题（题干 + 正确答案要点），用于巩固"
+}
+`;
+
+  try {
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'user', content: prompt }],
+        thinking: { type: 'disabled' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    const llmText = extractLlmText(response.data);
+    let data;
+    try {
+      data = parseLlmJson(llmText);
+    } catch (parseError) {
+      console.error('错题讲解 JSON 解析失败:', llmText);
+      return res.status(500).json({ msg: 'AI 返回格式错误，请稍后重试' });
+    }
+
+    res.json({
+      explain: data.explain || '',
+      pitfalls: data.pitfalls || '',
+      variant: data.variant || '',
+    });
+  } catch (error) {
+    console.error('错题讲解失败:', error.response ? error.response.data : error.message);
+    res.status(500).json({
+      msg: 'AI 讲解失败',
+      error: error.response ? error.response.data : error.message,
+    });
+  }
+};
+
+// ========== 六、AI 生成学习笔记 ==========
+
+// POST /api/ai/note  把知识点整理成结构化 Markdown 笔记
+// body: { title, content }
+exports.generateNote = async (req, res) => {
+  const { title, content } = req.body;
+  if (!content || !String(content).trim()) {
+    return res.status(400).json({ msg: '缺少知识点内容' });
+  }
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  const prompt = `
+你是一名擅长整理笔记的学习助教。请把下面的知识点整理成一份结构清晰、适合复习的 Markdown 学习笔记。
+
+【知识点标题】: ${title || '未命名'}
+【知识点原文】:
+"""
+${content}
+"""
+
+要求：
+1. 用 Markdown 输出，包含：一句话概述、核心要点（分点列出）、关键术语解释、易错/注意点、一句话总结；
+2. 语言简明准确，适合考前快速复习；
+3. 不要使用 LaTeX 公式，不要出现反斜杠字符；
+4. 直接输出笔记正文，不要额外开场白或代码块包裹。
+`;
+
+  try {
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'user', content: prompt }],
+        thinking: { type: 'disabled' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    const note = extractLlmText(response.data);
+    res.json({ note });
+  } catch (error) {
+    console.error('AI 生成笔记失败:', error.response ? error.response.data : error.message);
+    res.status(500).json({
+      msg: 'AI 生成笔记失败',
+      error: error.response ? error.response.data : error.message,
+    });
+  }
+};
