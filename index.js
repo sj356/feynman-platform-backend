@@ -36,6 +36,7 @@ console.log("准备加载knowledgePoints路由");
 app.use('/api/users', require('./routes/users'));
 app.use('/api/knowledge-points', require('./routes/knowledgePoints'));
 app.use('/api/audio', require('./routes/audio'));
+app.use('/api/ai', require('./routes/ai'));
 console.log("准备加载questions路由");
 // 获取当前登录用户信息接口
 app.get('/api/user', async (req,res)=>{

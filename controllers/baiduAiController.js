@@ -82,7 +82,15 @@ function parseLlmJson(text) {
   let cleaned = String(text).trim();
   const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fence) cleaned = fence[1].trim();
-  return JSON.parse(cleaned);
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (err) {
+    // 容错：模型常在题干/解析里写 LaTeX（如 \int \alpha），单反斜杠不是合法 JSON 转义。
+    // 把“后面不是合法 JSON 转义字符”的单反斜杠补成双反斜杠，再解析一次。
+    const fixed = cleaned.replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+    return JSON.parse(fixed);
+  }
 }
 
 // 评价费曼复述：润色文本 + 综合评价 + 优缺点 + 打分
@@ -165,6 +173,281 @@ ${transcribedText}
     );
     res.status(500).json({
       msg: 'AI 评价失败',
+      error: error.response ? error.response.data : error.message,
+    });
+  }
+};
+
+// ========== 三、AI 出题（单选 / 多选 / 判断对错 / 简答） ==========
+
+// 单选题 Prompt
+function buildChoicePrompt(content, difficulty) {
+  return `
+你是一个专业的计算机科学出题专家。请根据以下知识点内容和指定难度，生成一道相关的单项选择题。
+
+【知识点内容】:
+"""
+${content}
+"""
+
+【指定难度】: ${difficulty}（可选值：基础 / 中等 / 困难）
+
+请严格按照以下 JSON 格式返回题目，不要包含任何额外解释、Markdown 代码块或文字，确保所有字段都存在：
+{
+  "type": "single-choice",
+  "difficulty": "${difficulty}",
+  "question": "这里是题干",
+  "options": {
+    "A": "选项A的内容",
+    "B": "选项B的内容",
+    "C": "选项C的内容",
+    "D": "选项D的内容"
+  },
+  "answer": "C",
+  "explanation": "这里是对正确答案的简短解释"
+}
+`;
+}
+
+// 多项选择题 Prompt（answer 为多个选项组成的数组）
+function buildMultiplePrompt(content, difficulty) {
+  return `
+你是一个专业的计算机科学出题专家。请根据以下知识点内容和指定难度，生成一道相关的多项选择题（有两个或两个以上正确选项）。
+
+【知识点内容】:
+"""
+${content}
+"""
+
+【指定难度】: ${difficulty}（可选值：基础 / 中等 / 困难）
+
+请严格按照以下 JSON 格式返回题目，不要包含任何额外解释、Markdown 代码块或文字，确保所有字段都存在：
+{
+  "type": "multiple-choice",
+  "difficulty": "${difficulty}",
+  "question": "这里是题干（题干需提示有多个正确选项）",
+  "options": {
+    "A": "选项A的内容",
+    "B": "选项B的内容",
+    "C": "选项C的内容",
+    "D": "选项D的内容"
+  },
+  "answer": ["A", "C"],
+  "explanation": "这里是对正确答案的简短解释"
+}
+`;
+}
+
+// 判断对错题 Prompt（answer 为 "true" 或 "false"）
+function buildTrueFalsePrompt(content, difficulty) {
+  return `
+你是一个专业的计算机科学出题专家。请根据以下知识点内容和指定难度，生成一道相关的判断对错题。
+
+【知识点内容】:
+"""
+${content}
+"""
+
+【指定难度】: ${difficulty}（可选值：基础 / 中等 / 困难）
+
+注意：题干和解释中不要使用 LaTeX 公式，不要出现反斜杠字符；数学符号用普通文字或常见符号描述（例如“积分”“F(b)-F(a)”）。
+
+请严格按照以下 JSON 格式返回题目，不要包含任何额外解释、Markdown 代码块或文字，确保所有字段都存在：
+{
+  "type": "true-false",
+  "difficulty": "${difficulty}",
+  "question": "这里是一句需要判断正误的陈述句",
+  "answer": "true",
+  "explanation": "这里是判断理由的简短解释"
+}
+注意：answer 只能是 "true"（正确）或 "false"（错误）。
+`;
+}
+
+// 简答题 Prompt（输出“答案要点”而非唯一标准答案）
+function buildShortAnswerPrompt(content, difficulty) {
+  return `
+你是一个专业的计算机科学出题专家。请根据以下知识点内容和指定难度，生成一道相关的简答题。
+
+【知识点内容】:
+"""
+${content}
+"""
+
+【指定难度】: ${difficulty}（可选值：基础 / 中等 / 困难）
+
+请严格按照以下 JSON 格式返回题目，不要包含任何额外解释、Markdown 代码块或文字，确保所有字段都存在：
+{
+  "type": "short-answer",
+  "difficulty": "${difficulty}",
+  "question": "这里是简答题题干",
+  "answer_key_points": [
+    "答案要点1",
+    "答案要点2",
+    "答案要点3"
+  ]
+}
+`;
+}
+
+// POST /api/ai/generate-question
+// body: { knowledgePointContent, difficulty, type }
+// type: 'single-choice' | 'multiple-choice' | 'true-false' | 'short-answer'
+exports.generateQuestion = async (req, res) => {
+  const { knowledgePointContent, difficulty, type } = req.body;
+
+  if (!knowledgePointContent || !difficulty) {
+    return res.status(400).json({ msg: '缺少知识点内容或难度' });
+  }
+
+  // 允许的四种题型，非法值默认单选
+  const VALID_TYPES = ['single-choice', 'multiple-choice', 'true-false', 'short-answer'];
+  const questionType = VALID_TYPES.includes(type) ? type : 'single-choice';
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  let prompt;
+  if (questionType === 'single-choice') {
+    prompt = buildChoicePrompt(knowledgePointContent, difficulty);
+  } else if (questionType === 'multiple-choice') {
+    prompt = buildMultiplePrompt(knowledgePointContent, difficulty);
+  } else if (questionType === 'true-false') {
+    prompt = buildTrueFalsePrompt(knowledgePointContent, difficulty);
+  } else {
+    prompt = buildShortAnswerPrompt(knowledgePointContent, difficulty);
+  }
+
+  try {
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'user', content: prompt }],
+        thinking: { type: 'disabled' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log('出题模型原始返回:', response.data);
+
+    const llmText = extractLlmText(response.data);
+
+    let questionData;
+    try {
+      questionData = parseLlmJson(llmText);
+    } catch (parseError) {
+      console.error('题目 JSON 解析失败:', llmText);
+      return res.status(500).json({ msg: 'AI 返回格式错误，请稍后重试' });
+    }
+
+    // 兜底补齐字段，避免模型漏传
+    questionData.type = questionType;
+    questionData.difficulty = difficulty;
+
+    res.json(questionData);
+  } catch (error) {
+    console.error(
+      '调用大模型出题出错:',
+      error.response ? error.response.data : error.message
+    );
+    res.status(500).json({
+      msg: 'AI 出题失败',
+      error: error.response ? error.response.data : error.message,
+    });
+  }
+};
+
+// POST /api/ai/grade-answer  （简答题 AI 评分）
+// body: { question, answerKeyPoints, studentAnswer }
+exports.gradeAnswer = async (req, res) => {
+  const { question, answerKeyPoints, studentAnswer } = req.body;
+
+  if (!question || !studentAnswer) {
+    return res.status(400).json({ msg: '缺少题目或学生回答' });
+  }
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  const keyPointsText = Array.isArray(answerKeyPoints)
+    ? answerKeyPoints.map((p, i) => `${i + 1}. ${p}`).join('\n')
+    : String(answerKeyPoints || '');
+
+  const prompt = `
+你是一个客观的计算机科学阅卷老师。请根据以下题目、答案要点和学生的回答，判断学生的回答是否正确，并给出简短解释。
+
+【题目】:
+${question}
+
+【答案要点】:
+${keyPointsText}
+
+【学生的回答】:
+${studentAnswer}
+
+请严格按照以下 JSON 格式返回评判结果，不要包含任何额外解释、Markdown 代码块或文字：
+{
+  "isCorrect": true,
+  "explanation": "这里是评判理由，例如：回答基本正确，覆盖了主要区别；或：回答混淆了相关概念。"
+}
+`;
+
+  try {
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'user', content: prompt }],
+        thinking: { type: 'disabled' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log('评分模型原始返回:', response.data);
+
+    const llmText = extractLlmText(response.data);
+    let result;
+    try {
+      result = parseLlmJson(llmText);
+    } catch (parseError) {
+      console.error('评分 JSON 解析失败:', llmText);
+      return res.status(500).json({ msg: 'AI 评分返回格式错误，请稍后重试' });
+    }
+
+    res.json({
+      isCorrect: Boolean(result.isCorrect),
+      explanation: result.explanation || '',
+    });
+  } catch (error) {
+    console.error(
+      '调用大模型评分出错:',
+      error.response ? error.response.data : error.message
+    );
+    res.status(500).json({
+      msg: 'AI 评分失败',
       error: error.response ? error.response.data : error.message,
     });
   }
