@@ -733,3 +733,208 @@ ${content}
     });
   }
 };
+
+// ========== 七、RAG 知识库问答（检索私有知识点 → 大模型生成） ==========
+
+const { queryVectorStore } = require('../services/vectorStoreService');
+
+// POST /api/ai/rag-qa  基于本地私有知识库的问答
+// body: { question }
+exports.answerWithRAG = async (req, res) => {
+  const { question } = req.body;
+
+  if (!question || !String(question).trim()) {
+    return res.status(400).json({ msg: 'Question is required.' });
+  }
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  try {
+    // 1. 从向量库检索最相关的知识点片段
+    const relevantDocs = await queryVectorStore(String(question).trim(), 4);
+
+    // 2. 把检索到的片段拼成上下文（无结果时给空上下文，Prompt 里要求模型如实说不知道）
+    const contextText = relevantDocs
+      .map((doc, i) => `--- 资料 ${i + 1} ---\n${doc.pageContent}`)
+      .join('\n\n');
+
+    // 3. 遵循大模型上下文协议（MCP）的结构化 Prompt：明确角色 / 指令 / 上下文 / 问题
+    const prompt =
+      `<role>你是一个知识库问答机器人。</role>\n` +
+      `<instruction>请根据下面提供的<context>信息来回答用户的<question>。如果上下文中没有相关信息，就明确说你不知道，不要编造答案。请让回答简洁明了。</instruction>\n\n` +
+      `<context>\n${contextText || '（未检索到相关知识点）'}\n</context>\n\n` +
+      `<question>\n${String(question).trim()}\n</question>\n\n` +
+      `<answer>你的回答是：</answer>`;
+
+    // 4. 调用豆包（火山方舟）对话模型生成答案
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'user', content: prompt }],
+        thinking: { type: 'disabled' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    const answer = extractLlmText(response.data) || '（模型未返回有效回答）';
+
+    // 5. 同时把检索到的片段回传，便于前端展示引用来源（选做）
+    const sources = relevantDocs.map((doc) => ({
+      content: doc.pageContent,
+      knowledgePointId: doc.metadata?.knowledgePointId || null,
+    }));
+
+    res.json({ answer, sources });
+  } catch (error) {
+    console.error('RAG Chain execution error:', error.response ? error.response.data : error.message);
+    res.status(500).json({
+      msg: 'Error answering question with RAG.',
+      error: error.response ? error.response.data : error.message,
+    });
+  }
+};
+
+// ========== 八、RAG 知识库问答（流式 SSE，逐字输出） ==========
+
+// POST /api/ai/rag-qa-stream  基于私有知识库的流式问答
+// body: { question }
+// 响应：text/event-stream，事件类型：delta（文本片段）/ sources（引用资料）/ done / error
+exports.answerWithRAGStream = async (req, res) => {
+  const { question } = req.body;
+
+  if (!question || !String(question).trim()) {
+    return res.status(400).json({ msg: 'Question is required.' });
+  }
+
+  const arkApiKey = process.env.ARK_API_KEY;
+  const arkModel = process.env.ARK_MODEL;
+  if (!arkApiKey || !arkModel) {
+    return res.status(500).json({ msg: '后端未配置 ARK_API_KEY 或 ARK_MODEL' });
+  }
+
+  // SSE 辅助函数：按事件类型推送一行
+  const sendEvent = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  try {
+    // 1. 检索最相关片段
+    const relevantDocs = await queryVectorStore(String(question).trim(), 4);
+
+    // 2. 拼上下文
+    const contextText = relevantDocs
+      .map((doc, i) => `--- 资料 ${i + 1} ---\n${doc.pageContent}`)
+      .join('\n\n');
+
+    // 3. MCP 结构化 Prompt
+    const prompt =
+      `<role>你是一个知识库问答机器人。</role>\n` +
+      `<instruction>请根据下面提供的<context>信息来回答用户的<question>。如果上下文中没有相关信息，就明确说你不知道，不要编造答案。请让回答简洁明了。</instruction>\n\n` +
+      `<context>\n${contextText || '（未检索到相关知识点）'}\n</context>\n\n` +
+      `<question>\n${String(question).trim()}\n</question>\n\n` +
+      `<answer>你的回答是：</answer>`;
+
+    // 4. 先以 SSE 方式建立响应头
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    // 5. 回传引用资料（前端可在回答下方展示）
+    const sources = relevantDocs.map((doc) => ({
+      content: doc.pageContent,
+      knowledgePointId: doc.metadata?.knowledgePointId || null,
+    }));
+    sendEvent('sources', sources);
+
+    // 6. 调用豆包流式接口（stream: true），逐块读取并推送
+    const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+    const response = await axios.post(
+      url,
+      {
+        model: arkModel,
+        messages: [{ role: 'user', content: prompt }],
+        thinking: { type: 'disabled' },
+        stream: true,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${arkApiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        responseType: 'stream',
+        timeout: 60000,
+      }
+    );
+
+    let buffer = '';
+    let finished = false;
+
+    // 解析上游 SSE 行：data: {...}
+    const handleChunk = (chunk) => {
+      buffer += chunk.toString('utf8');
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // 最后一段可能不完整，留到下一块
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === '[DONE]') {
+          finished = true;
+          continue;
+        }
+        try {
+          const json = JSON.parse(payload);
+          const delta = json?.choices?.[0]?.delta?.content;
+          if (delta) sendEvent('delta', { text: delta });
+        } catch (parseErr) {
+          // 忽略无法解析的心跳/空行
+        }
+      }
+    };
+
+    response.data.on('data', handleChunk);
+
+    response.data.on('end', () => {
+      if (!finished) sendEvent('done', {});
+      res.end();
+    });
+
+    response.data.on('error', (streamErr) => {
+      console.error('流式响应出错:', streamErr.message);
+      sendEvent('error', { msg: '流式生成中断' });
+      res.end();
+    });
+
+    // 客户端断开时清理监听，避免泄漏
+    req.on('close', () => {
+      response.data?.destroy?.();
+    });
+  } catch (error) {
+    console.error('RAG 流式执行错误:', error.response ? error.response.data : error.message);
+    // 若响应头尚未发出，按普通 JSON 报错；已发出则用 SSE error 事件
+    if (!res.headersSent) {
+      return res.status(500).json({
+        msg: 'Error answering question with RAG stream.',
+        error: error.response ? error.response.data : error.message,
+      });
+    }
+    sendEvent('error', { msg: '生成失败，请稍后再试' });
+    res.end();
+  }
+};

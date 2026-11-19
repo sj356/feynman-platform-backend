@@ -9,6 +9,8 @@ const {
   chatTutor,
   explainWrong,
   generateNote,
+  answerWithRAG,
+  answerWithRAGStream,
 } = require('../controllers/baiduAiController');
 
 // POST /api/ai/generate-question  AI 出题
@@ -28,5 +30,11 @@ router.post('/explain-wrong', auth, explainWrong);
 
 // POST /api/ai/note  AI 生成结构化学习笔记
 router.post('/note', auth, generateNote);
+
+// POST /api/ai/rag-qa  基于私有知识库的 RAG 问答
+router.post('/rag-qa', auth, answerWithRAG);
+
+// POST /api/ai/rag-qa-stream  基于私有知识库的 RAG 流式问答（SSE）
+router.post('/rag-qa-stream', auth, answerWithRAGStream);
 
 module.exports = router;

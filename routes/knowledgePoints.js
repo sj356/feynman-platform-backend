@@ -4,7 +4,10 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const KnowledgePoint = require('../models/KnowledgePoint');
 // 【新增】引入 RAG 向量索引服务
-const { addKnowledgePointToStore } = require('../services/vectorStoreService');
+const {
+  addKnowledgePointToStore,
+  rebuildIndexForKnowledgePoints,
+} = require('../services/vectorStoreService');
 
 //1. 创建知识点 POST /api/knowledge-points
 router.post('/', auth, async (req, res) => {
@@ -98,6 +101,11 @@ router.delete('/:id', auth, async (req, res) => {
       return res.status(401).json({ msg: 'Not authorized' });
     }
     await KnowledgePoint.findByIdAndDelete(req.params.id);
+
+    // 【新增】删除后按该用户现存知识点重建向量库，清掉被删知识点的旧向量（异步，不阻塞响应）
+    const remaining = await KnowledgePoint.find({ user: req.user.id }).select('_id title content');
+    rebuildIndexForKnowledgePoints(remaining);
+
     res.json({ msg: 'Knowledge point removed' });
   } catch (err) {
     console.error(err.message);
