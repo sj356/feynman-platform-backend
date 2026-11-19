@@ -11,6 +11,21 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
+// 兜底：部分 Windows 环境下 Node 会把 DNS 服务器误读为 127.0.0.1，
+// 导致 MongoDB Atlas 的 SRV/TXT 记录解析失败（ESERVFAIL / ECONNREFUSED）。
+// 这里若检测到 DNS 是本机回环地址，则改用系统公共 DNS，不改动其他业务逻辑。
+const dns = require('dns');
+try {
+  const servers = dns.getServers();
+  const looksLocal = servers.some((s) => s === '127.0.0.1' || s === '::1' || s.startsWith('127.'));
+  if (looksLocal) {
+    dns.setServers(['223.5.5.5', '114.114.114.114']);
+    console.log('已切换 DNS 服务器用于 Atlas 域名解析');
+  }
+} catch (e) {
+  console.warn('DNS 兜底设置跳过：', e.message);
+}
+
 // 连接数据库（硬编码，你当前能正常连接的版本，增加超时配置）
 mongoose.connect("mongodb+srv://2991455971_db_user:%40Gsj20060313@cluster0.5zs5wpk.mongodb.net/feynman-db?appName=Cluster0", {
   serverSelectionTimeoutMS: 30000,
@@ -39,6 +54,8 @@ app.use('/api/audio', require('./routes/audio'));
 app.use('/api/ai', require('./routes/ai'));
 app.use('/api/records', require('./routes/records'));
 app.use('/api/statistics', require('./routes/statistics'));
+// 👇 新增：知识图谱数据接口
+app.use('/api/graph', require('./routes/graph'));
 console.log("准备加载questions路由");
 // 获取当前登录用户信息接口
 app.get('/api/user', async (req,res)=>{
