@@ -13,15 +13,12 @@ app.use(express.json());
 
 // 兜底：部分 Windows 环境下 Node 会把 DNS 服务器误读为 127.0.0.1，
 // 导致 MongoDB Atlas 的 SRV/TXT 记录解析失败（ESERVFAIL / ECONNREFUSED）。
-// 这里若检测到 DNS 是本机回环地址，则改用系统公共 DNS，不改动其他业务逻辑。
+// 这里显式指定稳定的公共 DNS，保证 Atlas 域名可解析，不改动其他业务逻辑。
 const dns = require('dns');
 try {
-  const servers = dns.getServers();
-  const looksLocal = servers.some((s) => s === '127.0.0.1' || s === '::1' || s.startsWith('127.'));
-  if (looksLocal) {
-    dns.setServers(['223.5.5.5', '114.114.114.114']);
-    console.log('已切换 DNS 服务器用于 Atlas 域名解析');
-  }
+  const before = dns.getServers();
+  dns.setServers(['223.5.5.5', '114.114.114.114']);
+  console.log(`DNS 服务器：${before.join(',')} → ${dns.getServers().join(',')}`);
 } catch (e) {
   console.warn('DNS 兜底设置跳过：', e.message);
 }
